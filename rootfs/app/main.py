@@ -20,14 +20,21 @@ logger = logging.getLogger("BridgeController")
 app = FastAPI(title="Universal Guest Audio Bridge", docs_url=None, redoc_url=None)
 
 INDEX_HTML_PATH = Path(__file__).parent / "templates" / "index.html"
-
 DATA_DIR = Path("/data")
 CONFIG_FILE = DATA_DIR / "selected_speakers.json"
 OPTIONS_FILE = DATA_DIR / "options.json"
+CUSTOM_TOKEN_FILE = DATA_DIR / "custom_ha_token.txt"
 
-SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
-SUPERVISOR_API_URL = "http://supervisor/core/api"
+SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "") or os.getenv("HASSIO_TOKEN", "")
 SNAPSERVER_JSONRPC_URL = "http://127.0.0.1:1780/jsonrpc"
+
+# host_network: true 환경에서 DNS 실패를 방지하기 위한 다중 후보 엔드포인트
+SUPERVISOR_API_URLS = [
+    "http://supervisor/core/api",
+    "http://172.30.32.2/core/api",
+    "http://127.0.0.1:8123/api",
+]
+_active_api_url: Optional[str] = None
 
 # 전역 런타임 상태
 runtime_state = {
@@ -46,13 +53,24 @@ def get_local_host_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
-        # 8.8.8.8로 라우팅되는 기본 인터페이스 IP 획득 (실제 연결 없음)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_active_token() -> str:
+    """환경변수 토큰 또는 사용자가 등록한 커스텀 토큰 반환"""
+    if CUSTOM_TOKEN_FILE.exists():
+        try:
+            tok = CUSTOM_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+        except Exception:
+            pass
+    return SUPERVISOR_TOKEN
 
 
 def load_selected_speakers() -> List[str]:
@@ -83,30 +101,52 @@ def save_selected_speakers(speakers: List[str]) -> bool:
 
 
 async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict] = None) -> Any:
-    """Home Assistant Supervisor API 호출 유틸리티"""
-    if not SUPERVISOR_TOKEN:
-        logger.warning("SUPERVISOR_TOKEN 환경변수가 없습니다. (로컬 디버그 모드)")
+    """Home Assistant Supervisor / Core API 다중 엔드포인트 자동 Fallback 호출"""
+    global _active_api_url
+    token = get_active_token()
+    if not token:
+        msg = "인증 토큰(SUPERVISOR_TOKEN 또는 사용자 지정 토큰)이 없습니다."
+        logger.warning(msg)
+        runtime_state["last_error"] = msg
         return None
 
     headers = {
-        "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    url = f"{SUPERVISOR_API_URL}/{endpoint.lstrip('/')}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            if method.upper() == "GET":
-                async with session.get(url, headers=headers, timeout=5) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    logger.error(f"HA API GET {url} 에러: {resp.status}")
-            elif method.upper() == "POST":
-                async with session.post(url, headers=headers, json=payload or {}, timeout=5) as resp:
-                    if resp.status in (200, 201):
-                        return await resp.json()
-                    logger.error(f"HA API POST {url} 에러: {resp.status}")
-    except Exception as e:
-        logger.error(f"HA API 통신 오류: {e}")
+
+    candidate_urls = [url for url in SUPERVISOR_API_URLS if url == _active_api_url] + \
+                     [url for url in SUPERVISOR_API_URLS if url != _active_api_url]
+
+    clean_endpoint = endpoint.lstrip("/")
+
+    async with aiohttp.ClientSession() as session:
+        for base_url in candidate_urls:
+            url = f"{base_url}/{clean_endpoint}"
+            try:
+                if method.upper() == "GET":
+                    async with session.get(url, headers=headers, timeout=4) as resp:
+                        if resp.status == 200:
+                            _active_api_url = base_url
+                            runtime_state["last_error"] = None
+                            return await resp.json()
+                        err_text = f"{base_url} 응답 상태: {resp.status}"
+                        logger.warning(f"HA API GET {url} 에러: {err_text}")
+                        runtime_state["last_error"] = err_text
+                elif method.upper() == "POST":
+                    async with session.post(url, headers=headers, json=payload or {}, timeout=4) as resp:
+                        if resp.status in (200, 201):
+                            _active_api_url = base_url
+                            runtime_state["last_error"] = None
+                            return await resp.json()
+                        err_text = f"{base_url} 응답 상태: {resp.status}"
+                        logger.warning(f"HA API POST {url} 에러: {err_text}")
+                        runtime_state["last_error"] = err_text
+            except Exception as e:
+                err_text = f"{base_url} 연결 오류: {str(e)}"
+                logger.debug(err_text)
+                runtime_state["last_error"] = err_text
+
     return None
 
 
@@ -145,8 +185,7 @@ async def relay_stream_to_speakers(source_name: str, force: bool = False):
     await call_ha_service("media_player", "turn_on", {"entity_id": speakers})
     await asyncio.sleep(0.3)
 
-    # 2. 재생 명령 전송 (개별 또는 그룹)
-    # Music Assistant 전용 플레이어(mass) 또는 표준 media_player 모두 지원
+    # 2. 재생 명령 전송
     media_data = {
         "entity_id": speakers,
         "media_content_id": stream_url,
@@ -157,10 +196,9 @@ async def relay_stream_to_speakers(source_name: str, force: bool = False):
         },
     }
 
-    # Music Assistant 전용 서비스 호출 시도 후 fallback
+    # Music Assistant(mass) 서비스 우선 시도 후 일반 media_player fallback
     success = await call_ha_service("mass", "play_media", media_data)
     if not success:
-        # 일반 media_player.play_media로 전송
         await call_ha_service("media_player", "play_media", {
             "entity_id": speakers,
             "media_content_id": stream_url,
@@ -206,7 +244,6 @@ async def background_audio_monitor():
                     await relay_stream_to_speakers(active_source)
             else:
                 if runtime_state["is_streaming"]:
-                    # 곡 변경 시 끊김 방지를 위한 디바운싱 (3초 유지)
                     idle_counter += 1
                     if idle_counter >= 3:
                         runtime_state["is_streaming"] = False
@@ -238,6 +275,10 @@ class VolumeRequest(BaseModel):
     volume_level: float
 
 
+class TokenRequest(BaseModel):
+    token: str
+
+
 # --- Routes ---
 @app.get("/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
@@ -258,15 +299,30 @@ async def get_status():
         "host_ip": runtime_state["host_ip"],
         "stream_url": f"http://{runtime_state['host_ip']}:1780/stream",
         "selected_speakers": load_selected_speakers(),
+        "has_token": bool(get_active_token()),
+        "active_api_url": _active_api_url,
     })
 
 
 @app.get("/api/speakers")
 async def list_media_players():
-    """Home Assistant에서 모든 media_player 엔티티 조회"""
+    """Home Assistant에서 모든 media_player 엔티티 조회 (디버그 정보 포함)"""
+    token = get_active_token()
     states = await call_ha_api("states")
+
+    debug_info = {
+        "token_exists": bool(token),
+        "token_len": len(token) if token else 0,
+        "active_api_url": _active_api_url,
+        "last_error": runtime_state.get("last_error"),
+        "total_entities_found": len(states) if isinstance(states, list) else 0,
+    }
+
     if not states or not isinstance(states, list):
-        return JSONResponse({"speakers": []})
+        return JSONResponse({
+            "speakers": [],
+            "debug": debug_info,
+        })
 
     speakers = []
     selected_set = set(load_selected_speakers())
@@ -285,19 +341,20 @@ async def list_media_players():
                 "supported_features": attributes.get("supported_features", 0),
             })
 
-    # 이름 기준 오름차순 정렬
     speakers.sort(key=lambda x: x["name"].lower())
-    return JSONResponse({"speakers": speakers})
+    return JSONResponse({
+        "speakers": speakers,
+        "debug": debug_info,
+    })
 
 
 @app.post("/api/speakers/select")
 async def set_selected_speakers(req: SpeakerSelectionRequest):
-    """출력 스피커 목록 영구 저장 및 현재 스트리밍 중일 시 즉시 릴레이 갱신"""
+    """출력 스피커 목록 영구 저장"""
     success = save_selected_speakers(req.speakers)
     if not success:
         raise HTTPException(status_code=500, detail="스피커 설정 저장에 실패했습니다.")
 
-    # 스트리밍 중인 상태에서 스피커가 추가/변경되면 즉시 새 스피커로도 스트림 전송
     if runtime_state["is_streaming"] and req.speakers:
         await relay_stream_to_speakers(runtime_state["active_source"], force=True)
 
@@ -316,6 +373,23 @@ async def set_speaker_volume(req: VolumeRequest):
         "volume_level": level,
     })
     return JSONResponse({"success": success})
+
+
+@app.post("/api/token")
+async def save_custom_token(req: TokenRequest):
+    """사용자가 직접 입력한 Home Assistant 장기 액세스 토큰 저장"""
+    clean_token = req.token.strip()
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if clean_token:
+            CUSTOM_TOKEN_FILE.write_text(clean_token, encoding="utf-8")
+        elif CUSTOM_TOKEN_FILE.exists():
+            CUSTOM_TOKEN_FILE.unlink()
+        global _active_api_url
+        _active_api_url = None
+        return JSONResponse({"success": True})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/playback/stop")

@@ -22,6 +22,13 @@ echo "[Universal Guest Audio Bridge] Speaker Name: ${SPEAKER_NAME}"
 echo "[Universal Guest Audio Bridge] Audio Sample Rate: ${AUDIO_SAMPLE_RATE}"
 echo "[Universal Guest Audio Bridge] DLNA/UPnP Port: 49152 (Fixed)"
 
+# host_network: true 환경에서 supervisor 도메인 해석 보장
+if ! grep -q "supervisor" /etc/hosts 2>/dev/null; then
+    echo "172.30.32.2 supervisor" >> /etc/hosts 2>/dev/null || true
+fi
+export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
+export HASSIO_TOKEN="${HASSIO_TOKEN:-}"
+
 # 영구 저장 스피커 목록 파일 초기화
 mkdir -p "$DATA_DIR"
 if [ ! -f "$DATA_DIR/selected_speakers.json" ]; then
