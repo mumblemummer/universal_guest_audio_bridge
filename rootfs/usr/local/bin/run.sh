@@ -58,6 +58,29 @@ envsubst '${SPEAKER_NAME} ${AUDIO_SAMPLE_RATE}' < /etc/mpd.conf.template > /etc/
 envsubst '${SPEAKER_NAME} ${AUDIO_SAMPLE_RATE}' < /etc/upmpdcli.conf.template > /etc/upmpdcli.conf
 envsubst '${SPEAKER_NAME} ${AUDIO_SAMPLE_RATE}' < /etc/snapserver.conf.template > /etc/snapserver.conf
 
+# Avahi가 도커 브릿지(172.30.32.1)를 광고하지 않고 실제 LAN IP(192.168.1.x)만 mDNS로 광고하도록 설정
+mkdir -p /etc/avahi
+cat << 'EOF' > /etc/avahi/avahi-daemon.conf
+[server]
+use-ipv4=yes
+use-ipv6=no
+deny-interfaces=hassio,docker0,veth0
+enable-dbus=yes
+disallow-other-stacks=no
+
+[wide-area]
+enable-wide-area=yes
+
+[publish]
+publish-addresses=yes
+publish-hinfo=yes
+publish-workstation=no
+publish-domain=yes
+
+[reflector]
+enable-reflector=no
+EOF
+
 # supervisord 설정 복사 확인
 if [ ! -f /etc/supervisord.conf ]; then
     cp /rootfs/etc/supervisord.conf /etc/supervisord.conf 2>/dev/null || true

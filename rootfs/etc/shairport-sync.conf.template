@@ -3,8 +3,8 @@ general = {
   output_backend = "pipe";
   mdns_backend = "avahi";
   port = 5000;
-  udp_port_base = 6001;
-  udp_port_range = 100;
+  udp_port_base = 6000;
+  udp_port_range = 10;
   interpolation = "soxr";
 };
 
