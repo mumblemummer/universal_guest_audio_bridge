@@ -18,7 +18,7 @@ audio_output {
     name        "DLNA_FIFO"
     path        "/tmp/snapfifo_dlna"
     format      "${AUDIO_SAMPLE_RATE}"
-    always_on   "yes"
+    mixer_type  "software"
 }
 
 filesystem_charset "UTF-8"

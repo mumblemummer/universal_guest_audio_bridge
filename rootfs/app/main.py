@@ -1,14 +1,19 @@
 import asyncio
+from collections import deque
 import json
 import logging
 import os
-import socket
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import select
+import socket
+import struct
+import threading
+import time
+from typing import Any, Deque, Dict, List, Optional, Set
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -25,27 +30,144 @@ CONFIG_FILE = DATA_DIR / "selected_speakers.json"
 OPTIONS_FILE = DATA_DIR / "options.json"
 CUSTOM_TOKEN_FILE = DATA_DIR / "custom_ha_token.txt"
 
-SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "") or os.getenv("HASSIO_TOKEN", "")
-SNAPSERVER_JSONRPC_URL = "http://127.0.0.1:1780/jsonrpc"
+FIFO_AIRPLAY = "/tmp/snapfifo_airplay"
+FIFO_DLNA = "/tmp/snapfifo_dlna"
+FIFO_SNAP = "/tmp/snapfifo_snap"
 
-# host_network: true 환경에서 DNS 실패를 방지하기 위한 다중 후보 엔드포인트
-SUPERVISOR_API_URLS = [
-    "http://supervisor/core/api",
-    "http://172.30.32.2/core/api",
-    "http://127.0.0.1:8123/api",
-]
-_active_api_url: Optional[str] = None
+SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "") or os.getenv("HASSIO_TOKEN", "")
 
 # 전역 런타임 상태
 runtime_state = {
     "is_streaming": False,
     "active_source": "None",  # "AirPlay", "DLNA", "None"
-    "stream_detected_at": 0.0,
-    "last_idle_at": 0.0,
+    "last_audio_ts": 0.0,
     "host_ip": "127.0.0.1",
     "selected_speakers": [],
     "last_error": None,
 }
+
+# 오디오 스트림 브로드캐스트 허브 상태
+_preroll_buffer: Deque[bytes] = deque(maxlen=25)  # 최근 약 0.5초 PCM 청크 보관
+_stream_subscribers: Set[asyncio.Queue] = set()
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+_active_api_url: Optional[str] = None
+
+# 50ms 분량의 무음 PCM 프레임 (44100Hz * 2ch * 2bytes * 0.05s = 8820 bytes)
+SILENCE_CHUNK = b"\x00" * 8820
+
+
+def make_wav_header(sample_rate: int = 44100, bits_per_sample: int = 16, channels: int = 2) -> bytes:
+    """실시간 라이브 스트리밍용 표준 44바이트 RIFF WAVE 헤더 생성"""
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    data_size = 0x7FFFFFFF  # 무한 스트림용 최대 길이
+    riff_size = data_size + 36
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM format
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+
+
+WAV_HEADER = make_wav_header(44100, 16, 2)
+
+
+def _broadcast_pcm_chunk(chunk: bytes):
+    """이벤트 루프 스레드에서 모든 연결된 HTTP 스트림 클라이언트로 오디오 청크 전달"""
+    dead_queues = []
+    for q in _stream_subscribers:
+        try:
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(chunk)
+        except Exception:
+            dead_queues.append(q)
+    for q in dead_queues:
+        _stream_subscribers.discard(q)
+
+
+def _fifo_reader_thread():
+    """전용 데몬 스레드에서 AirPlay 및 DLNA FIFO 파이프를 Non-blocking으로 읽어 실시간 브로드캐스트"""
+    logger.info("FIFO 오디오 허브 리더 스레드 시작")
+    fd_airplay = -1
+    fd_dlna = -1
+    fd_snap = -1
+
+    while True:
+        try:
+            if fd_airplay < 0 and os.path.exists(FIFO_AIRPLAY):
+                fd_airplay = os.open(FIFO_AIRPLAY, os.O_RDWR | os.O_NONBLOCK)
+            if fd_dlna < 0 and os.path.exists(FIFO_DLNA):
+                fd_dlna = os.open(FIFO_DLNA, os.O_RDWR | os.O_NONBLOCK)
+            if fd_snap < 0 and os.path.exists(FIFO_SNAP):
+                fd_snap = os.open(FIFO_SNAP, os.O_RDWR | os.O_NONBLOCK)
+
+            read_fds = [fd for fd in (fd_airplay, fd_dlna) if fd >= 0]
+            if not read_fds:
+                time.sleep(0.5)
+                continue
+
+            readable, _, _ = select.select(read_fds, [], [], 0.05)
+            got_active_audio = False
+
+            for fd in readable:
+                try:
+                    chunk = os.read(fd, 8192)
+                except BlockingIOError:
+                    continue
+                except Exception:
+                    if fd == fd_airplay:
+                        os.close(fd_airplay)
+                        fd_airplay = -1
+                    elif fd == fd_dlna:
+                        os.close(fd_dlna)
+                        fd_dlna = -1
+                    continue
+
+                if not chunk:
+                    continue
+
+                # 무음(전부 0x00)이 아닌 실제 오디오 신호인지 확인
+                is_audible = chunk.count(0) < len(chunk)
+                if is_audible:
+                    got_active_audio = True
+                    source_name = "AirPlay" if fd == fd_airplay else "DLNA"
+                    runtime_state["last_audio_ts"] = time.monotonic()
+                    runtime_state["active_source"] = source_name
+                    _preroll_buffer.append(chunk)
+
+                    # Snapserver 파이프로 전달
+                    if fd_snap >= 0:
+                        try:
+                            os.write(fd_snap, chunk)
+                        except Exception:
+                            pass
+
+                    # HTTP 스트림 구독자들에게 브로드캐스트
+                    if _main_loop and _stream_subscribers:
+                        _main_loop.call_soon_threadsafe(_broadcast_pcm_chunk, chunk)
+
+            # 파이프 입력이 없는 순간에도 연결된 스트림 클라이언트가 끊기지 않도록 무음 프레임 공급
+            if not got_active_audio and _main_loop and _stream_subscribers:
+                _main_loop.call_soon_threadsafe(_broadcast_pcm_chunk, SILENCE_CHUNK)
+
+        except Exception as e:
+            logger.error(f"FIFO 리더 스레드 오류: {e}")
+            time.sleep(0.5)
 
 
 def get_local_host_ip() -> str:
@@ -61,8 +183,17 @@ def get_local_host_ip() -> str:
         return "127.0.0.1"
 
 
+def has_custom_token() -> bool:
+    if CUSTOM_TOKEN_FILE.exists():
+        try:
+            return bool(CUSTOM_TOKEN_FILE.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    return False
+
+
 def get_active_token() -> str:
-    """환경변수 토큰 또는 사용자가 등록한 커스텀 토큰 반환"""
+    """사용자 등록 커스텀 토큰 또는 Supervisor 토큰 반환"""
     if CUSTOM_TOKEN_FILE.exists():
         try:
             tok = CUSTOM_TOKEN_FILE.read_text(encoding="utf-8").strip()
@@ -101,7 +232,7 @@ def save_selected_speakers(speakers: List[str]) -> bool:
 
 
 async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict] = None) -> Any:
-    """Home Assistant Supervisor / Core API 다중 엔드포인트 자동 Fallback 호출"""
+    """Home Assistant Core / Supervisor API 호출"""
     global _active_api_url
     token = get_active_token()
     if not token:
@@ -115,8 +246,17 @@ async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict
         "Content-Type": "application/json",
     }
 
-    candidate_urls = [url for url in SUPERVISOR_API_URLS if url == _active_api_url] + \
-                     [url for url in SUPERVISOR_API_URLS if url != _active_api_url]
+    # 사용자 지정 토큰(LLAT)인 경우 로컬 8123 포트를 직접 호출 (Supervisor 프록시는 LLAT를 401 거부함)
+    if has_custom_token():
+        candidate_urls = ["http://127.0.0.1:8123/api"]
+    else:
+        base_list = [
+            "http://supervisor/core/api",
+            "http://172.30.32.2/core/api",
+            "http://127.0.0.1:8123/api",
+        ]
+        candidate_urls = [url for url in base_list if url == _active_api_url] + \
+                         [url for url in base_list if url != _active_api_url]
 
     clean_endpoint = endpoint.lstrip("/")
 
@@ -125,7 +265,7 @@ async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict
             url = f"{base_url}/{clean_endpoint}"
             try:
                 if method.upper() == "GET":
-                    async with session.get(url, headers=headers, timeout=4) as resp:
+                    async with session.get(url, headers=headers, timeout=5) as resp:
                         if resp.status == 200:
                             _active_api_url = base_url
                             runtime_state["last_error"] = None
@@ -134,14 +274,18 @@ async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict
                         logger.warning(f"HA API GET {url} 에러: {err_text}")
                         runtime_state["last_error"] = err_text
                 elif method.upper() == "POST":
-                    async with session.post(url, headers=headers, json=payload or {}, timeout=4) as resp:
+                    async with session.post(url, headers=headers, json=payload or {}, timeout=8) as resp:
                         if resp.status in (200, 201):
                             _active_api_url = base_url
                             runtime_state["last_error"] = None
                             return await resp.json()
-                        err_text = f"{base_url} 응답 상태: {resp.status}"
+                        body_text = await resp.text()
+                        err_text = f"{base_url} 응답 상태: {resp.status} ({body_text[:120]})"
                         logger.warning(f"HA API POST {url} 에러: {err_text}")
                         runtime_state["last_error"] = err_text
+                        # 400/500은 서버 연결은 되었으나 서비스 파라미터 오류이므로 다른 URL로 재시도하지 않음
+                        if resp.status in (400, 422, 500):
+                            break
             except Exception as e:
                 err_text = f"{base_url} 연결 오류: {str(e)}"
                 logger.debug(err_text)
@@ -151,58 +295,49 @@ async def call_ha_api(endpoint: str, method: str = "GET", payload: Optional[dict
 
 
 async def call_ha_service(domain: str, service: str, service_data: dict) -> bool:
-    """HA 서비스 호출 (예: media_player/play_media)"""
+    """HA 서비스 호출"""
     res = await call_ha_api(f"services/{domain}/{service}", method="POST", payload=service_data)
     return res is not None
 
 
-_snap_session: Optional[aiohttp.ClientSession] = None
-
-async def get_snapserver_status() -> Optional[dict]:
-    """Snapserver JSON-RPC로 모든 스트림 상태 조회 (Persistent 세션 사용)"""
-    global _snap_session
-    if _snap_session is None or _snap_session.closed:
-        _snap_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2))
-    payload = {"jsonrpc": "2.0", "method": "Server.GetStatus", "id": 1}
-    try:
-        async with _snap_session.post(SNAPSERVER_JSONRPC_URL, json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("result", {})
-    except Exception:
-        pass
-    return None
+def get_stream_url() -> str:
+    """스피커들이 접속할 본 애드온의 실시간 WAV 오디오 스트림 URL"""
+    return f"http://{runtime_state['host_ip']}:8099/stream.wav"
 
 
 async def relay_stream_to_speakers(source_name: str, force: bool = False):
-    """선택된 스피커들로 Snapcast 오디오 스트림 재생 명령 전송"""
+    """선택된 스피커들로 실시간 WAV 오디오 스트림 재생 명령 전송"""
     speakers = load_selected_speakers()
     if not speakers:
         logger.info("선택된 출력 스피커가 없어 스트림 릴레이를 건너뜁니다.")
         return
 
-    host_ip = runtime_state["host_ip"]
-    stream_url = f"http://{host_ip}:1780/stream"
-    logger.info(f"[{source_name}] 오디오 신호 감지 -> 선택 스피커({len(speakers)}대)로 스트림 릴레이: {stream_url}")
+    stream_url = get_stream_url()
+    logger.info(f"[{source_name}] 오디오 신호 감지 -> 선택 스피커({speakers})로 스트림 릴레이: {stream_url}")
 
-    # 1. 대상 스피커 전원 켜기
-    await call_ha_service("media_player", "turn_on", {"entity_id": speakers})
-    await asyncio.sleep(0.3)
+    # 현재 스피커 상태를 확인하여 'off'이고 TURN_ON(128)을 지원하는 스피커만 켜기 호출
+    states = await call_ha_api("states")
+    if isinstance(states, list):
+        state_map = {s.get("entity_id"): s for s in states}
+        off_speakers = []
+        for spk in speakers:
+            st = state_map.get(spk)
+            if st and st.get("state") == "off":
+                features = st.get("attributes", {}).get("supported_features", 0)
+                if features & 128:  # SUPPORT_TURN_ON
+                    off_speakers.append(spk)
+        if off_speakers:
+            await call_ha_service("media_player", "turn_on", {"entity_id": off_speakers})
+            await asyncio.sleep(0.5)
 
-    # 2. 재생 명령 전송
-    media_data = {
+    # 표준 media_player.play_media 호출 (Music Assistant 및 일반 DLNA/Cast 스피커 모두 호환)
+    success = await call_ha_service("media_player", "play_media", {
         "entity_id": speakers,
         "media_content_id": stream_url,
-        "media_content_type": "music",
-        "extra": {
-            "title": f"Guest Audio ({source_name})",
-            "thumb": "https://brands.home-assistant.io/shairport_sync/icon.png",
-        },
-    }
-
-    # Music Assistant(mass) 서비스 우선 시도 후 일반 media_player fallback
-    success = await call_ha_service("mass", "play_media", media_data)
+        "media_content_type": "audio/wav",
+    })
     if not success:
+        # fallback: media_content_type = "music"
         await call_ha_service("media_player", "play_media", {
             "entity_id": speakers,
             "media_content_id": stream_url,
@@ -215,57 +350,47 @@ async def stop_stream_on_speakers():
     speakers = load_selected_speakers()
     if not speakers:
         return
-    logger.info(f"오디오 스트림 유입 중단 -> 선택 스피커({len(speakers)}대) 재생 중지")
+    logger.info(f"오디오 스트림 유입 중단 -> 선택 스피커({speakers}) 재생 중지")
     await call_ha_service("media_player", "media_stop", {"entity_id": speakers})
 
 
 async def background_audio_monitor():
-    """백그라운드에서 Snapserver 스트림 상태를 실시간 감지하여 자동 릴레이"""
+    """FIFO 오디오 유입 상태를 감시하여 스피커 재생/중지 자동 트리거"""
     logger.info("오디오 감지 및 자동 브릿지 백그라운드 태스크 시작")
-    idle_counter = 0
 
     while True:
         try:
-            status_data = await get_snapserver_status()
-            active_source = "None"
-            is_active = False
-
-            if status_data and "server" in status_data:
-                streams = status_data.get("server", {}).get("streams", [])
-                for stream in streams:
-                    stream_id = stream.get("id", "")
-                    stream_status = stream.get("status", "idle")
-                    if stream_status == "playing":
-                        is_active = True
-                        active_source = stream_id
-                        break
+            now = time.monotonic()
+            elapsed = now - runtime_state["last_audio_ts"]
+            is_active = (runtime_state["last_audio_ts"] > 0) and (elapsed < 1.5)
 
             if is_active:
-                idle_counter = 0
-                if not runtime_state["is_streaming"] or runtime_state["active_source"] != active_source:
+                if not runtime_state["is_streaming"]:
                     runtime_state["is_streaming"] = True
-                    runtime_state["active_source"] = active_source
-                    await relay_stream_to_speakers(active_source)
+                    await relay_stream_to_speakers(runtime_state["active_source"])
             else:
-                if runtime_state["is_streaming"]:
-                    idle_counter += 1
-                    if idle_counter >= 3:
-                        runtime_state["is_streaming"] = False
-                        runtime_state["active_source"] = "None"
-                        idle_counter = 0
-                        await stop_stream_on_speakers()
+                # 5초 이상 오디오 신호가 없으면 스트림 종료로 판단 (곡 전환 시 끊김 방지)
+                if runtime_state["is_streaming"] and elapsed >= 5.0:
+                    runtime_state["is_streaming"] = False
+                    runtime_state["active_source"] = "None"
+                    await stop_stream_on_speakers()
 
         except Exception as e:
             logger.error(f"오디오 모니터링 루프 예외: {e}")
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
 
 @app.on_event("startup")
 async def on_startup():
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     runtime_state["host_ip"] = get_local_host_ip()
     runtime_state["selected_speakers"] = load_selected_speakers()
-    logger.info(f"Universal Guest Audio Bridge 시작됨 (Host IP: {runtime_state['host_ip']})")
+    logger.info(f"Universal Guest Audio Bridge 시작됨 (Host IP: {runtime_state['host_ip']}, Stream URL: {get_stream_url()})")
+
+    t = threading.Thread(target=_fifo_reader_thread, daemon=True)
+    t.start()
     asyncio.create_task(background_audio_monitor())
 
 
@@ -283,7 +408,74 @@ class TokenRequest(BaseModel):
     token: str
 
 
-# --- Routes ---
+# --- Live Audio Stream Endpoints ---
+@app.head("/stream")
+@app.head("/stream.wav")
+async def stream_head():
+    """Music Assistant verify_item_uri HEAD 요청 대응"""
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "audio/wav",
+            "Cache-Control": "no-cache, no-store",
+            "Accept-Ranges": "none",
+            "icy-name": "Universal Guest Audio Bridge",
+        },
+    )
+
+
+@app.get("/stream")
+@app.get("/stream.wav")
+async def stream_audio(request: Request):
+    """스피커 및 Music Assistant가 접속하는 실시간 WAV(PCM) 라이브 스트리밍 엔드포인트"""
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"오디오 스트림 클라이언트 연결됨: {client_ip}")
+
+    async def wav_generator():
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _stream_subscribers.add(q)
+        try:
+            # 1. 표준 44바이트 WAV 헤더 즉시 전송
+            yield WAV_HEADER
+
+            # 2. 초기 프리롤 버퍼 즉시 전송 (ffprobe / verify_item_uri 즉시 통과 보장)
+            initial_chunks = list(_preroll_buffer)
+            initial_bytes = b"".join(initial_chunks)
+            if len(initial_bytes) < 32768:
+                padding = b"\x00" * (32768 - len(initial_bytes))
+                initial_bytes = padding + initial_bytes
+            yield initial_bytes
+
+            # 3. 실시간 오디오 청크 연속 스트리밍
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+                    yield chunk
+                except asyncio.TimeoutError:
+                    yield SILENCE_CHUNK
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"스트림 전송 종료 ({client_ip}): {e}")
+        finally:
+            _stream_subscribers.discard(q)
+            logger.info(f"오디오 스트림 클라이언트 연결 해제됨: {client_ip}")
+
+    return StreamingResponse(
+        wav_generator(),
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "Connection": "keep-alive",
+            "Accept-Ranges": "none",
+            "icy-name": "Universal Guest Audio Bridge",
+        },
+    )
+
+
+# --- Web UI & Control Routes ---
 @app.get("/", response_class=HTMLResponse)
 @app.get("/index.html", response_class=HTMLResponse)
 async def index_page(request: Request):
@@ -301,7 +493,7 @@ async def get_status():
         "is_streaming": runtime_state["is_streaming"],
         "active_source": runtime_state["active_source"],
         "host_ip": runtime_state["host_ip"],
-        "stream_url": f"http://{runtime_state['host_ip']}:1780/stream",
+        "stream_url": get_stream_url(),
         "selected_speakers": load_selected_speakers(),
         "has_token": bool(get_active_token()),
         "active_api_url": _active_api_url,
@@ -310,7 +502,7 @@ async def get_status():
 
 @app.get("/api/speakers")
 async def list_media_players():
-    """Home Assistant에서 모든 media_player 엔티티 조회 (디버그 정보 포함)"""
+    """Home Assistant에서 모든 media_player 엔티티 조회 및 스마트 정렬"""
     token = get_active_token()
     states = await call_ha_api("states")
 
@@ -330,22 +522,50 @@ async def list_media_players():
 
     speakers = []
     selected_set = set(load_selected_speakers())
+    own_speaker_name = os.getenv("SPEAKER_NAME", "Guest Room Audio").lower()
 
     for state in states:
         entity_id = state.get("entity_id", "")
-        if entity_id.startswith("media_player."):
-            attributes = state.get("attributes", {})
-            speakers.append({
-                "entity_id": entity_id,
-                "name": attributes.get("friendly_name", entity_id),
-                "state": state.get("state", "off"),
-                "volume_level": attributes.get("volume_level", 0.5),
-                "is_volume_muted": attributes.get("is_volume_muted", False),
-                "is_selected": entity_id in selected_set,
-                "supported_features": attributes.get("supported_features", 0),
-            })
+        if not entity_id.startswith("media_player."):
+            continue
 
-    speakers.sort(key=lambda x: x["name"].lower())
+        attributes = state.get("attributes", {})
+        friendly_name = attributes.get("friendly_name", entity_id)
+
+        # 자기 자신(가상 수신기)은 오디오 무한 루프 방지를 위해 출력 대상에서 제외
+        if "guest_room_audio" in entity_id.lower() or own_speaker_name in friendly_name.lower():
+            continue
+
+        st_val = state.get("state", "off")
+        is_selected = entity_id in selected_set
+        is_available = st_val not in ("unavailable", "unknown")
+        is_edifier_or_mass = (
+            "edifier" in friendly_name.lower()
+            or "edifier" in entity_id.lower()
+            or attributes.get("app_id") == "music_assistant"
+            or "mass_player_type" in attributes
+        )
+
+        speakers.append({
+            "entity_id": entity_id,
+            "name": friendly_name,
+            "state": st_val,
+            "volume_level": attributes.get("volume_level", 0.5),
+            "is_volume_muted": attributes.get("is_volume_muted", False),
+            "is_selected": is_selected,
+            "is_available": is_available,
+            "is_priority": is_edifier_or_mass,
+            "supported_features": attributes.get("supported_features", 0),
+        })
+
+    # 정렬 우선순위: 1. 선택됨 -> 2. 사용 가능(Available) -> 3. Edifier/MA 기기 -> 4. 이름순
+    speakers.sort(key=lambda x: (
+        not x["is_selected"],
+        not x["is_available"],
+        not x["is_priority"],
+        x["name"].lower(),
+    ))
+
     return JSONResponse({
         "speakers": speakers,
         "debug": debug_info,

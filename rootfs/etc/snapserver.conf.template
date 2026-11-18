@@ -5,8 +5,7 @@ datadir = /var/lib/snapserver
 [stream]
 bind_to_address = 0.0.0.0
 port = 1704
-source = pipe:///tmp/snapfifo_airplay?name=AirPlay&sampleformat=${AUDIO_SAMPLE_RATE}&codec=flac
-source = pipe:///tmp/snapfifo_dlna?name=DLNA&sampleformat=${AUDIO_SAMPLE_RATE}&codec=flac
+source = pipe:///tmp/snapfifo_snap?name=GuestAudio&sampleformat=${AUDIO_SAMPLE_RATE}&codec=flac
 buffer = 1000
 codec = flac
 send_to_muted = false

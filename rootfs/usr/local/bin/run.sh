@@ -46,9 +46,10 @@ fi
 
 # Named FIFO 파이프 생성
 echo "[Universal Guest Audio Bridge] Setting up FIFO pipes..."
-rm -f /tmp/snapfifo_airplay /tmp/snapfifo_dlna
+rm -f /tmp/snapfifo_airplay /tmp/snapfifo_dlna /tmp/snapfifo_snap
 mkfifo -m 666 /tmp/snapfifo_airplay
 mkfifo -m 666 /tmp/snapfifo_dlna
+mkfifo -m 666 /tmp/snapfifo_snap
 
 # 설정 템플릿 환경변수 치환
 echo "[Universal Guest Audio Bridge] Generating configuration files from templates..."
