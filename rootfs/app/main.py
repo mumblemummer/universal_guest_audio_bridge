@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -20,8 +19,7 @@ logger = logging.getLogger("BridgeController")
 
 app = FastAPI(title="Universal Guest Audio Bridge", docs_url=None, redoc_url=None)
 
-TEMPLATES_DIR = Path(__file__).parent / "templates"
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+INDEX_HTML_PATH = Path(__file__).parent / "templates" / "index.html"
 
 DATA_DIR = Path("/data")
 CONFIG_FILE = DATA_DIR / "selected_speakers.json"
@@ -242,9 +240,13 @@ class VolumeRequest(BaseModel):
 
 # --- Routes ---
 @app.get("/", response_class=HTMLResponse)
+@app.get("/index.html", response_class=HTMLResponse)
 async def index_page(request: Request):
     """HA Ingress 웹 UI 렌더링"""
-    return templates.TemplateResponse("index.html", {"request": request})
+    if INDEX_HTML_PATH.exists():
+        content = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        return HTMLResponse(content=content)
+    return HTMLResponse(content="<h1>Dashboard index.html not found</h1>", status_code=404)
 
 
 @app.get("/api/status")
