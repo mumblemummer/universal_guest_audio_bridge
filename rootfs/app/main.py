@@ -156,15 +156,19 @@ async def call_ha_service(domain: str, service: str, service_data: dict) -> bool
     return res is not None
 
 
+_snap_session: Optional[aiohttp.ClientSession] = None
+
 async def get_snapserver_status() -> Optional[dict]:
-    """Snapserver JSON-RPC로 모든 스트림 상태 조회"""
+    """Snapserver JSON-RPC로 모든 스트림 상태 조회 (Persistent 세션 사용)"""
+    global _snap_session
+    if _snap_session is None or _snap_session.closed:
+        _snap_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2))
     payload = {"jsonrpc": "2.0", "method": "Server.GetStatus", "id": 1}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(SNAPSERVER_JSONRPC_URL, json=payload, timeout=2) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("result", {})
+        async with _snap_session.post(SNAPSERVER_JSONRPC_URL, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("result", {})
     except Exception:
         pass
     return None

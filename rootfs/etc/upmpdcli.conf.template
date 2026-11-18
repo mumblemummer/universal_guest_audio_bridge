@@ -6,8 +6,9 @@ mpdhost = 127.0.0.1
 mpdport = 6600
 
 # UPnP / DLNA 네트워크 및 포트 설정
-# host_network: true 환경에서 모든 인터페이스(0.0.0.0)로부터 수신 허용
-upnpip = 0.0.0.0
+# upnpip를 지정하지 않으면 libupnp가 첫 번째 비루프백 LAN 인터페이스(192.168.x.x)를 자동 감지하여 바인딩합니다.
+# (0.0.0.0 설정 시 UPNP_E_INVALID_INTERFACE 오류 발생하므로 비워둠)
+# upnpip =
 
 # 방화벽(OPNsense 등) 정책과 일치하도록 DLNA/UPnP 수신 포트를 49152번으로 고정 바인딩
 upnpport = 49152
