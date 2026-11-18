@@ -1,0 +1,22 @@
+name: "Universal Guest Audio Bridge"
+description: "손님 스마트폰(AirPlay/DLNA) 오디오를 수신하여 Home Assistant 스피커 및 Music Assistant로 실시간 중계하는 로컬 애드온"
+version: "1.0.0"
+slug: "universal_guest_audio_bridge"
+init: false
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+host_network: true
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:cast-audio"
+panel_title: "Guest Audio"
+schema:
+  speaker_name: str
+  audio_sample_rate: str
+options:
+  speaker_name: "Guest Room Audio"
+  audio_sample_rate: "44100:16:2"

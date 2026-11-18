@@ -1,0 +1,22 @@
+# UPnP/DLNA 수신 장치 이름 (손님 스마트폰에 표시될 이름)
+friendlyname = ${SPEAKER_NAME} (DLNA)
+
+# 로컬 MPD 오디오 엔진 바인딩
+mpdhost = 127.0.0.1
+mpdport = 6600
+
+# UPnP / DLNA 네트워크 및 포트 설정
+# host_network: true 환경에서 모든 인터페이스(0.0.0.0)로부터 수신 허용
+upnpip = 0.0.0.0
+
+# 방화벽(OPNsense 등) 정책과 일치하도록 DLNA/UPnP 수신 포트를 49152번으로 고정 바인딩
+upnpport = 49152
+
+# OpenHome 프로토콜 및 런타임 설정
+openhome = 1
+radiolist = /usr/share/upmpdcli/radio_defs.xml
+pkgdatadir = /usr/share/upmpdcli
+pidfile = /var/run/upmpdcli.pid
+logfilename = /dev/stdout
+loglevel = 2
+checkrate = 0

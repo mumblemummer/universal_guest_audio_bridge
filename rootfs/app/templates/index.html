@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="ko" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Guest Audio Bridge</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#eef2ff',
+                            500: '#6366f1',
+                            600: '#4f46e5',
+                            700: '#4338ca',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #1f2937; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased flex flex-col custom-scrollbar">
+
+    <!-- Top Navigation / Header -->
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-30">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex flex-wrap items-center justify-between gap-4">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                    <i class="fa-solid fa-broadcast-tower text-white text-lg"></i>
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
+                        Guest Audio Bridge
+                    </h1>
+                    <p class="text-xs text-slate-400">AirPlay & DLNA to Home Assistant</p>
+                </div>
+            </div>
+
+            <!-- Streaming Status Badge -->
+            <div id="statusBadge" class="flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-300">
+                <span class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                <span>연결 확인 중...</span>
+            </div>
+
+            <!-- Global Action Buttons -->
+            <div class="flex items-center space-x-2">
+                <button onclick="fetchSpeakers()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition flex items-center space-x-1.5">
+                    <i class="fa-solid fa-arrows-rotate"></i>
+                    <span>새로고침</span>
+                </button>
+                <button onclick="testPlayback()" class="px-3 py-1.5 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/40 text-indigo-300 text-xs font-medium transition flex items-center space-x-1.5">
+                    <i class="fa-solid fa-play"></i>
+                    <span>테스트 릴레이</span>
+                </button>
+                <button onclick="stopPlayback()" class="px-3 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/40 border border-rose-500/30 text-rose-300 text-xs font-medium transition flex items-center space-x-1.5">
+                    <i class="fa-solid fa-stop"></i>
+                    <span>전체 중지</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="flex-1 max-w-6xl mx-auto w-full px-4 py-6 space-y-6">
+
+        <!-- Stream Info Card -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex items-center space-x-4">
+                <div class="w-12 h-12 rounded-xl bg-sky-500/10 text-sky-400 flex items-center justify-center text-xl">
+                    <i class="fa-brands fa-apple"></i>
+                </div>
+                <div>
+                    <div class="text-xs text-slate-400">iOS (iPhone/iPad)</div>
+                    <div class="font-semibold text-sm text-slate-200">AirPlay 수신 활성화</div>
+                    <div class="text-[11px] text-slate-500">제어 센터 오디오 공유에서 탐색</div>
+                </div>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex items-center space-x-4">
+                <div class="w-12 h-12 rounded-xl bg-emerald-500/10 text-emerald-400 flex items-center justify-center text-xl">
+                    <i class="fa-brands fa-android"></i>
+                </div>
+                <div>
+                    <div class="text-xs text-slate-400">Android / Windows</div>
+                    <div class="font-semibold text-sm text-slate-200">DLNA/UPnP 수신 활성화</div>
+                    <div class="text-[11px] text-slate-500">BubbleUPnP, 삼성 뮤직 등 캐스트</div>
+                </div>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                    <div class="text-xs text-slate-400">Snapcast Stream URL</div>
+                    <div id="streamUrlText" class="font-mono text-xs text-indigo-400 mt-1 select-all break-all">
+                        http://...:1780/stream
+                    </div>
+                </div>
+                <button onclick="copyStreamUrl()" class="p-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition" title="스트림 주소 복사">
+                    <i class="fa-solid fa-copy"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Speaker Selection & Control Section -->
+        <section class="space-y-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-2">
+                    <i class="fa-solid fa-volume-high text-indigo-400"></i>
+                    <h2 class="text-lg font-bold text-slate-100">동기화 출력 스피커 선택</h2>
+                    <span id="selectedCountBadge" class="text-xs px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-semibold">0개 선택됨</span>
+                </div>
+                <div class="text-xs text-slate-400">
+                    선택 즉시 <code class="text-indigo-400 bg-slate-900 px-1.5 py-0.5 rounded">/data/selected_speakers.json</code>에 영구 반영
+                </div>
+            </div>
+
+            <!-- Speaker Cards Grid -->
+            <div id="speakerGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <!-- 스피커 로딩 스켈레톤 -->
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 animate-pulse h-36"></div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 animate-pulse h-36"></div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 animate-pulse h-36"></div>
+            </div>
+        </section>
+
+        <!-- Music Assistant (MA) Integration Guide Accordion -->
+        <details class="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 text-xs group">
+            <summary class="font-semibold text-slate-300 cursor-pointer flex items-center justify-between select-none">
+                <span class="flex items-center space-x-2">
+                    <i class="fa-solid fa-circle-info text-indigo-400"></i>
+                    <span>Music Assistant (MA) & Edifier ES300 2대 스테레오 동기화 연동 가이드</span>
+                </span>
+                <i class="fa-solid fa-chevron-down group-open:rotate-180 transition-transform"></i>
+            </summary>
+            <div class="mt-4 space-y-2 text-slate-400 border-t border-slate-800 pt-3 leading-relaxed">
+                <p>1. <strong>스피커 다중 선택:</strong> 위 리스트에서 2대의 Edifier ES300 스피커를 모두 체크하면, 오디오 입력이 들어올 때 두 스피커에 동시에 스트림이 전송됩니다.</p>
+                <p>2. <strong>Music Assistant 그룹 활용:</strong> MA에서 두 스피커를 하나의 <strong>'Sync Group'</strong> 또는 <strong>'Universal Group'</strong>으로 묶어둔 경우, 해당 그룹 엔티티(예: <code class="text-indigo-300">media_player.livingroom_edifier_group</code>)만 선택하면 MA의 완벽한 딜레이 보정 동기화 스트리밍이 적용됩니다.</p>
+                <p>3. <strong>Snapcast 프로바이더 연동:</strong> Music Assistant 설정 &gt; 플레이어 프로바이더 &gt; Snapcast를 추가한 뒤 호스트를 <code class="text-indigo-300">127.0.0.1:1704</code>로 지정하면 MA 내부에서 고품질 멀티룸 엔진으로 직접 오디오를 제어할 수도 있습니다.</p>
+            </div>
+        </details>
+    </main>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="fixed bottom-5 right-5 transform translate-y-20 opacity-0 transition-all duration-300 bg-indigo-600 text-white px-4 py-2.5 rounded-xl shadow-xl flex items-center space-x-2 text-sm z-50">
+        <i class="fa-solid fa-circle-check"></i>
+        <span id="toastMessage">설정이 저장되었습니다.</span>
+    </div>
+
+    <!-- JavaScript logic -->
+    <script>
+        // Ingress 호환 상대 경로 처리
+        const getBasePath = () => {
+            let path = window.location.pathname;
+            return path.endsWith('/') ? path.slice(0, -1) : path;
+        };
+        const API_BASE = getBasePath() + '/api';
+
+        let allSpeakers = [];
+        let selectedSpeakers = new Set();
+        let streamUrl = '';
+
+        // 토스트 표시
+        function showToast(msg) {
+            const toast = document.getElementById('toast');
+            const toastMsg = document.getElementById('toastMessage');
+            toastMsg.innerText = msg;
+            toast.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => {
+                toast.classList.add('translate-y-20', 'opacity-0');
+            }, 2500);
+        }
+
+        // 스트림 URL 복사
+        function copyStreamUrl() {
+            if (!streamUrl) return;
+            navigator.clipboard.writeText(streamUrl).then(() => {
+                showToast('스트림 URL이 클립보드에 복사되었습니다.');
+            });
+        }
+
+        // 상태 및 스트림 정보 폴링
+        async function fetchStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/status`);
+                if (!res.ok) return;
+                const data = await res.json();
+                
+                streamUrl = data.stream_url;
+                document.getElementById('streamUrlText').innerText = streamUrl;
+
+                const badge = document.getElementById('statusBadge');
+                if (data.is_streaming) {
+                    const source = data.active_source || 'Audio';
+                    badge.innerHTML = `
+                        <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
+                        <span class="text-emerald-400 font-bold">${source} 실시간 스트리밍 중</span>
+                    `;
+                    badge.className = "flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-500/50 text-xs font-semibold";
+                } else {
+                    badge.innerHTML = `
+                        <span class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                        <span class="text-slate-400">대기 중 (신호 없음)</span>
+                    `;
+                    badge.className = "flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-400";
+                }
+
+                // 선택된 스피커 동기화
+                if (Array.isArray(data.selected_speakers)) {
+                    selectedSpeakers = new Set(data.selected_speakers);
+                    document.getElementById('selectedCountBadge').innerText = `${selectedSpeakers.size}개 선택됨`;
+                }
+            } catch (e) {
+                console.error("상태 로드 에러:", e);
+            }
+        }
+
+        // 스피커 목록 로드 및 렌더링
+        async function fetchSpeakers() {
+            try {
+                const res = await fetch(`${API_BASE}/speakers`);
+                if (!res.ok) throw new Error("스피커 목록 조회 실패");
+                const data = await res.json();
+                allSpeakers = data.speakers || [];
+                renderSpeakers();
+            } catch (e) {
+                console.error("스피커 로드 에러:", e);
+                document.getElementById('speakerGrid').innerHTML = `
+                    <div class="col-span-full py-8 text-center text-rose-400 bg-rose-950/20 border border-rose-900 rounded-2xl">
+                        스피커 목록을 불러오지 못했습니다. Home Assistant Supervisor API 연결을 확인하세요.
+                    </div>
+                `;
+            }
+        }
+
+        // 스피커 카드 UI 렌더링
+        function renderSpeakers() {
+            const grid = document.getElementById('speakerGrid');
+            if (allSpeakers.length === 0) {
+                grid.innerHTML = `
+                    <div class="col-span-full py-10 text-center text-slate-500 bg-slate-900/40 border border-slate-800/80 rounded-2xl">
+                        Home Assistant에 등록된 media_player 엔티티가 없습니다.
+                    </div>
+                `;
+                return;
+            }
+
+            grid.innerHTML = allSpeakers.map(spk => {
+                const isSelected = selectedSpeakers.has(spk.entity_id);
+                const volumePct = Math.round((spk.volume_level ?? 0.5) * 100);
+                const isEdifier = spk.name.toLowerCase().includes('edifier') || spk.entity_id.toLowerCase().includes('edifier');
+
+                return `
+                    <div class="group relative rounded-2xl border transition-all duration-200 p-5 flex flex-col justify-between ${
+                        isSelected 
+                            ? 'bg-gradient-to-b from-indigo-950/40 to-slate-900 border-indigo-500/50 shadow-lg shadow-indigo-950/40 ring-1 ring-indigo-500/30' 
+                            : 'bg-slate-900/80 border-slate-800 hover:border-slate-700'
+                    }">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="flex items-start space-x-3">
+                                <div class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                                    isSelected ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400'
+                                }">
+                                    <i class="fa-solid ${isEdifier ? 'fa-headphones' : 'fa-speaker'}"></i>
+                                </div>
+                                <div>
+                                    <h3 class="font-bold text-sm text-slate-100 flex items-center space-x-1.5">
+                                        <span>${spk.name}</span>
+                                        ${isEdifier ? '<span class="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">Edifier</span>' : ''}
+                                    </h3>
+                                    <div class="text-[11px] text-slate-500 font-mono truncate max-w-[170px]" title="${spk.entity_id}">
+                                        ${spk.entity_id}
+                                    </div>
+                                    <div class="mt-1 flex items-center space-x-2 text-[11px]">
+                                        <span class="inline-block w-2 h-2 rounded-full ${
+                                            spk.state === 'playing' ? 'bg-emerald-400' :
+                                            spk.state === 'idle' ? 'bg-amber-400' : 'bg-slate-600'
+                                        }"></span>
+                                        <span class="capitalize text-slate-400">${spk.state}</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- 선택 토글 체크박스 -->
+                            <button onclick="toggleSpeaker('${spk.entity_id}')" class="shrink-0 p-1 rounded-lg transition ${
+                                isSelected ? 'text-indigo-400' : 'text-slate-600 hover:text-slate-400'
+                            }">
+                                <i class="fa-solid text-xl ${isSelected ? 'fa-square-check' : 'fa-square'}"></i>
+                            </button>
+                        </div>
+
+                        <!-- 개별 볼륨 컨트롤 -->
+                        <div class="mt-4 pt-3 border-t border-slate-800/80">
+                            <div class="flex items-center justify-between text-xs text-slate-400 mb-1.5">
+                                <span>볼륨</span>
+                                <span id="vol-text-${spk.entity_id.replace(/\./g, '_')}" class="font-mono text-[11px] text-indigo-300">${volumePct}%</span>
+                            </div>
+                            <input 
+                                type="range" 
+                                min="0" 
+                                max="100" 
+                                value="${volumePct}"
+                                oninput="onVolumeInput('${spk.entity_id}', this.value)"
+                                onchange="setVolume('${spk.entity_id}', this.value)"
+                                class="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
+                            />
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // 볼륨 슬라이더 드래그 시 실시간 텍스트 갱신
+        function onVolumeInput(entityId, val) {
+            const el = document.getElementById(`vol-text-${entityId.replace(/\./g, '_')}`);
+            if (el) el.innerText = `${val}%`;
+        }
+
+        // 볼륨 변경 API 호출
+        async function setVolume(entityId, val) {
+            try {
+                await fetch(`${API_BASE}/speakers/volume`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        entity_id: entityId,
+                        volume_level: parseFloat(val) / 100.0
+                    })
+                });
+            } catch (e) {
+                console.error("볼륨 설정 에러:", e);
+            }
+        }
+
+        // 스피커 선택 토글 및 백엔드 저장
+        async function toggleSpeaker(entityId) {
+            if (selectedSpeakers.has(entityId)) {
+                selectedSpeakers.delete(entityId);
+            } else {
+                selectedSpeakers.add(entityId);
+            }
+            renderSpeakers();
+            document.getElementById('selectedCountBadge').innerText = `${selectedSpeakers.size}개 선택됨`;
+
+            try {
+                const res = await fetch(`${API_BASE}/speakers/select`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        speakers: Array.from(selectedSpeakers)
+                    })
+                });
+                if (res.ok) {
+                    showToast('출력 스피커 목록이 저장되었습니다.');
+                }
+            } catch (e) {
+                console.error("스피커 저장 실패:", e);
+            }
+        }
+
+        // 전체 일시정지 / 중지
+        async function stopPlayback() {
+            try {
+                const res = await fetch(`${API_BASE}/playback/stop`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('모든 선택 스피커 재생을 중지했습니다.');
+                    fetchStatus();
+                }
+            } catch (e) {
+                console.error("중지 실패:", e);
+            }
+        }
+
+        // 테스트 릴레이 재생
+        async function testPlayback() {
+            try {
+                const res = await fetch(`${API_BASE}/playback/play_test`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('선택 스피커로 오디오 스트림 릴레이를 테스트합니다.');
+                    fetchStatus();
+                }
+            } catch (e) {
+                console.error("테스트 실패:", e);
+            }
+        }
+
+        // 초기화 및 주기적 폴링
+        window.addEventListener('DOMContentLoaded', () => {
+            fetchStatus();
+            fetchSpeakers();
+            setInterval(fetchStatus, 2000); // 2초마다 스트림 상태 갱신
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+music_directory    "/var/lib/mpd/music"
+playlist_directory "/var/lib/mpd/playlists"
+db_file            "/var/lib/mpd/tag_cache"
+log_file           "/dev/stdout"
+pid_file           "/run/mpd/pid"
+state_file         "/var/lib/mpd/state"
+sticker_file       "/var/lib/mpd/sticker.sql"
+
+user               "root"
+bind_to_address    "127.0.0.1"
+port               "6600"
+auto_update        "no"
+restore_paused     "yes"
+max_output_buffer_size "16384"
+
+audio_output {
+    type        "fifo"
+    name        "DLNA_FIFO"
+    path        "/tmp/snapfifo_dlna"
+    format      "${AUDIO_SAMPLE_RATE}"
+    always_on   "yes"
+}
+
+filesystem_charset "UTF-8"

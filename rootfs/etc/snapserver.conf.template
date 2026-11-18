@@ -1,0 +1,27 @@
+[server]
+threads = -1
+datadir = /var/lib/snapserver
+
+[stream]
+bind_to_address = 0.0.0.0
+port = 1704
+source = pipe:///tmp/snapfifo_airplay?name=AirPlay&sampleformat=${AUDIO_SAMPLE_RATE}&codec=flac
+source = pipe:///tmp/snapfifo_dlna?name=DLNA&sampleformat=${AUDIO_SAMPLE_RATE}&codec=flac
+buffer = 1000
+codec = flac
+send_to_muted = false
+
+[http]
+enabled = true
+bind_to_address = 0.0.0.0
+port = 1780
+doc_root = /usr/share/snapserver/snapweb
+
+[tcp]
+enabled = true
+bind_to_address = 0.0.0.0
+port = 1705
+
+[logging]
+sink = stdout
+filter = *:info

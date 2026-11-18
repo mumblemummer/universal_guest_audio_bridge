@@ -1,0 +1,23 @@
+general = {
+  name = "${SPEAKER_NAME}";
+  output_backend = "pipe";
+  mdns_backend = "avahi";
+  port = 5000;
+  udp_port_base = 6001;
+  udp_port_range = 100;
+  interpolation = "soxr";
+};
+
+pipe = {
+  name = "/tmp/snapfifo_airplay";
+  audio_backend_buffer_desired_length = 44100;
+};
+
+sessioncontrol = {
+  allow_session_interruption = "yes";
+  session_timeout = 10;
+};
+
+diagnostics = {
+  log_verbosity = 0;
+};
